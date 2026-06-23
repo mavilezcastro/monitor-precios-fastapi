@@ -8,6 +8,8 @@ from datetime import datetime
 import re
 import json 
 import urllib.request
+from apscheduler.schedulers.background import BackgroundScheduler
+from contextlib import asynccontextmanager
 
 
 
@@ -27,9 +29,114 @@ db = cliente["montior_precios"]
 coleccion_productos = db["productos"]
 
 
+# --- CORE: FUNCIÓN DETONADORA DEL SCRAPER (EL TRABAJADOR) ---
+def procesar_un_producto(url:str, selector: str):
+    """
+    Esta función contiene la lógica central. 
+    Hace el scraping, limpia el precio, compara y dispara la alerta si baja.
+    """
+    print(f"🤖 [CORE] Iniciando chequeo para: {url}")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, timeout=60000)
+            precio_crudo = page.locator(selector).first.inner_text()
+            browser.close()
+    except Exception as e:
+        print(f"❌ [CORE] Error en Playwright para {url}: {str(e)}")
+        return {"status": "error", "message": str(e)}
+
+    if not precio_crudo:
+        print(f"⚠️ [CORE] No se encontró el precio para {url}")
+        return {"status": "error", "message": "Selector no encontrado"}
+
+    precio_actual = limpiar_precio(precio_crudo)
+    fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    producto_existente = db["productos"].find_one({"url": url})
+
+    if not producto_existente:
+        # Registro inicial
+        nuevo_producto = {
+            "url": url,
+            "selector": selector,
+            "precio_actual_catalogo": precio_actual,
+            "ultima_actualizacion": fecha_actual
+        }
+        db["productos"].insert_one(nuevo_producto)
+        return {"status": "success", "message": "Registrado por primera vez", "precio": precio_actual}
+    
+    else:
+        # Comparación histórica
+        precio_anterior = producto_existente["precio_actual_catalogo"]
+        
+        nuevo_historial = {
+            "producto_id": producto_existente["_id"],
+            "precio": precio_actual,
+            "fecha_capture": fecha_actual
+        }
+        db["historial_precios"].insert_one(nuevo_historial)
+
+        if precio_actual < precio_anterior:
+            producto_titulo = url.split("/")[-2].replace("-", " ").title()
+            enviar_alerta_discord(producto_titulo, precio_anterior, precio_actual, url)
+            
+            db["productos"].update_one(
+                {"_id": producto_existente["_id"]},
+                {"$set": {"precio_actual_catalogo": precio_actual, "ultima_actualizacion": fecha_actual}}
+            )
+            return {"status": "alerta", "precio_anterior": precio_anterior, "precio_nuevo": precio_actual}
+
+        db["productos"].update_one(
+            {"_id": producto_existente["_id"]},
+            {"$set": {"ultima_actualizacion": fecha_actual}}
+        )
+        return {"status": "success", "message": "Precio sin cambios", "precio": precio_actual}
+    
+# --- TAREA PROGRAMADA (CRON JOB) ---
+def tarea_automatica_monitoreo():
+    """
+    Esta función se ejecuta sola en segundo plano gracias al Scheduler.
+    Busca TODOS los productos de la base de datos y los manda a scrapear.
+    """
+    print(f"\n⏰ [SCHEDULER] ¡Hora de trabajar! Iniciando ciclo automático: {datetime.now()}")
+    
+    # Traemos todos los productos registrados en el catálogo maestro
+    productos = db["productos"].find()
+    
+    conteo = 0
+    for prod in productos:
+        procesar_un_producto(prod["url"], prod["selector"])
+        conteo += 1
+        
+    print(f"⏰ [SCHEDULER] Ciclo terminado. Se procesaron {conteo} productos.\n")
+
+# --- MANEJO DEL CICLO DE VIDA DE FASTAPI (LIFESPAN) ---
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 1. Al encender el servidor: Arrancamos el reloj en segundo plano
+    scheduler = BackgroundScheduler()
+    
+    # CONFIGURACIÓN DEL TIEMPO:
+    # Para el portafolio lo dejamos cada 30 segundos de modo que se pueda probar rápido.
+    # En producción lo cambiarías a: hours=12 o days=1
+    scheduler.add_job(tarea_automatica_monitoreo, 'interval', seconds=30)
+    
+    scheduler.start()
+    print("🚀 [SISTEMA] Scheduler encendido y programado cada 30 segundos.")
+    
+    yield  # Aquí es donde FastAPI se mantiene corriendo felizmente
+    
+    # 2. Al apagar el servidor: Apagamos el reloj limpiamente
+    scheduler.shutdown()
+    print("🛑 [SISTEMA] Scheduler apagado limpiamente.")
+
 # Iniciar server con uvicorn main:app --reload
 app = FastAPI(title="Monitor de Precios Inteligente",
-    description="API para hacer web scraping de productos y seguir su historial de precios.")
+    description="API para hacer web scraping de productos y seguir su historial de precios.",
+    lifespan=lifespan)
 
 # --- FUNCIONES AUXILIARES (UTILIDADES) ---
 def limpiar_precio(texto_precio: str) -> float:
@@ -111,95 +218,12 @@ class ProductoRequest(BaseModel):
     selector : str
 
 # --- ENDPOINTS ---
-@app.post("/check-price", status_code=status.HTTP_201_CREATED)
+@app.post("/check-price", status_code=status.HTTP_200_OK)
 def check_price(request: ProductoRequest):
-    # 1. Scraping del precio con Playwright
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(request.url, timeout=60000)
-            
-            # Extraemos el texto crudo de la página
-            precio_crudo = page.locator(request.selector).first.inner_text()
-            browser.close()
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, 
-            detail=f"Error al hacer scraping de la página: {str(e)}"
-        )
+    # Ahora el endpoint simplemente delega el trabajo a la función central
+    resultado = procesar_un_producto(request.url, request.selector)
+    return resultado
 
-    if not precio_crudo:
-        raise HTTPException(status_code=404, detail="No se pudo encontrar el precio con el selector provisto")
-
-    # 2. Procesamiento y Limpieza del Dato (Nivel Senior)
-    precio_actual = limpiar_precio(precio_crudo)
-    fecha_actual = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    # 3. Lógica de Base de Datos e Inteligencia de Alertas
-    producto_existente = db["productos"].find_one({"url": request.url})
-
-    if not producto_existente:
-        # CAMINO A: El producto es nuevo, lo registramos en el catálogo maestro
-        nuevo_producto = {
-            "url": request.url,
-            "selector": request.selector,
-            "precio_actual_catalogo": precio_actual, # Guardado como float
-            "ultima_actualizacion": fecha_actual
-        }
-        db["productos"].insert_one(nuevo_producto)
-        
-        return {
-            "status": "success",
-            "message": "Producto registrado por primera vez en el catálogo maestro.",
-            "precio_detectado": precio_actual
-        }
-    
-    else:
-        # CAMINO B: El producto ya existe, evaluamos si hay un cambio de precio
-        precio_anterior = producto_existente["precio_actual_catalogo"]
-        
-        # Guardamos el registro en la colección de históricos
-        nuevo_historial = {
-            "producto_id": producto_existente["_id"],
-            "precio": precio_actual, # Guardado como float
-            "fecha_captura": fecha_actual
-        }
-        db["historial_precios"].insert_one(nuevo_historial)
-
-        # ¡AQUÍ ESTÁ LA MAGIA PARA TU PORTAFOLIO!
-        # Evaluamos si el precio actual es estrictamente menor al que teníamos guardado
-        if precio_actual < precio_anterior:
-            # Simulamos el título del producto usando la URL o puedes extraerlo con un selector
-            producto_titulo = request.url.split("/")[-2].replace("-", " ").title()
-            
-            # Disparamos la alerta automática
-            enviar_alerta_discord(producto_titulo, precio_anterior, precio_actual, request.url)
-            
-            # Actualizamos el precio maestro en el catálogo para que sea el nuevo precio de referencia
-            db["productos"].update_one(
-                {"_id": producto_existente["_id"]},
-                {"$set": {"precio_actual_catalogo": precio_actual, "ultima_actualizacion": fecha_actual}}
-            )
-            
-            return {
-                "status": "alerta",
-                "message": "¡Oferta detectada! Alerta enviada al sistema de notificaciones.",
-                "precio_anterior": precio_anterior,
-                "precio_nuevo": precio_actual
-            }
-
-        # Si el precio es igual o subió, solo actualizamos la fecha de chequeo
-        db["productos"].update_one(
-            {"_id": producto_existente["_id"]},
-            {"$set": {"ultima_actualizacion": fecha_actual}}
-        )
-
-        return {
-            "status": "success",
-            "message": "Historial actualizado. El precio no ha bajado.",
-            "precio_actual": precio_actual
-        }
 
 
 @app.get("/price-history")
@@ -228,6 +252,7 @@ def get_price_history(url: str):
         },
         "historial_de_precios": lista_historial
     }
+
 
 
 
